@@ -12,6 +12,8 @@
 #include "RTClib.h"
 #include "DFRobot_PH.h"
 #include <EEPROM.h>
+#include <esp_task_wdt.h>
+#include <esp_system.h>
 
 HardwareSerial SerialGSM(2);
 TinyGsm modem(SerialGSM);
@@ -21,7 +23,6 @@ PubSubClient mqtt(client);
 NewPing sonar(SR04_TRIGGER_PIN, SR04_ECHO_PIN, SR04_MAX_DISTANCE);
 MedianFilter med(MED_WINDOW, 0);
 int lastMedian = 0;
-uint32_t sr04LastMs = 0;
 
 RTC_DS3231 rtc;
 Adafruit_ADS1115 ads;
@@ -42,6 +43,20 @@ float phVoltage_mV = NAN;
 float doVoltage_mV = NAN;
 float doValue = 0.0;
 unsigned long lastReconnectAttempt = 0;
+unsigned long lastPublishMs = 0;
+// watchdog timeout (seconds)
+#define WDT_TIMEOUT_S 10
+
+// mqtt offline buffer
+#define MAX_BUFFERED_MSGS 16
+#define MSG_LEN 192
+static char mqttBuffer[MAX_BUFFERED_MSGS][MSG_LEN];
+static uint8_t mqttBufHead = 0; // next write
+static uint8_t mqttBufTail = 0; // next read
+static uint8_t mqttBufCount = 0;
+
+// reconnect escalation
+static uint8_t mqttFailCount = 0;
 
 // dissolved oxygen saturation table by temperature (0-40°C)
 static const uint16_t DO_TABLE[41] = {
@@ -72,12 +87,56 @@ void checkNetwork() {
       if (mqtt.connect(mqtt_client_id, mqtt_username, mqtt_password)) {
         Serial.println(F("ok"));
         lastReconnectAttempt = 0;
+        mqttFailCount = 0;
+        // flush any buffered messages
+        while (mqttBufCount > 0 && mqtt.connected()) {
+          mqtt.publish(publish_topic, mqttBuffer[mqttBufTail]);
+          mqttBufTail = (mqttBufTail + 1) % MAX_BUFFERED_MSGS;
+          mqttBufCount--;
+        }
       } else {
         Serial.print(F("fail, rc="));
         Serial.println(mqtt.state());
         lastReconnectAttempt = millis();
+        mqttFailCount++;
+        if (mqttFailCount == 6) {
+          Serial.println(F("mqtt: restarting modem"));
+          modem.restart();
+        } else if (mqttFailCount >= 12) {
+          Serial.println(F("mqtt: too many failures, restarting esp"));
+          esp_restart();
+        }
       }
     }
+  }
+}
+
+static void bufferPush(const char* msg) {
+  if (mqttBufCount >= MAX_BUFFERED_MSGS) {
+    // drop oldest
+    mqttBufTail = (mqttBufTail + 1) % MAX_BUFFERED_MSGS;
+    mqttBufCount--;
+  }
+  strncpy(mqttBuffer[mqttBufHead], msg, MSG_LEN - 1);
+  mqttBuffer[mqttBufHead][MSG_LEN - 1] = '\0';
+  mqttBufHead = (mqttBufHead + 1) % MAX_BUFFERED_MSGS;
+  mqttBufCount++;
+}
+
+static void publishOrBuffer(const char* msg) {
+  if (mqtt.connected()) {
+    // flush buffer first
+    while (mqttBufCount > 0 && mqtt.connected()) {
+      mqtt.publish(publish_topic, mqttBuffer[mqttBufTail]);
+      mqttBufTail = (mqttBufTail + 1) % MAX_BUFFERED_MSGS;
+      mqttBufCount--;
+    }
+    if (!mqtt.publish(publish_topic, msg)) {
+      // push current if publish failed
+      bufferPush(msg);
+    }
+  } else {
+    bufferPush(msg);
   }
 }
 
@@ -165,10 +224,6 @@ static bool readSR04BatchMedian(int& outMedian, int& validCount) {
 }
 
 void handleSR04() {
-  uint32_t ms = millis();
-  if (ms - sr04LastMs < SR04_INTERVAL_MS) return;
-  sr04LastMs = ms;
-
   int batchMedian = 0;
   int validN = 0;
   if (readSR04BatchMedian(batchMedian, validN)) {
@@ -240,6 +295,9 @@ void setup() {
   modem.restart();
   connectGPRS();
   mqtt.setServer(mqtt_server, 1883);
+  mqtt.setKeepAlive(60);
+  mqtt.setSocketTimeout(30);
+  mqtt.setBufferSize(256);
 
   sensors.begin();
   bool rtcOk = rtc.begin();
@@ -250,6 +308,11 @@ void setup() {
   ph.begin();
 
   runStartupSelfTest(rtcOk, adsOk);
+  lastPublishMs = millis() - PUBLISH_INTERVAL_MS;
+
+  // init watchdog (allow long blocking reads, set to safe margin)
+  esp_task_wdt_init(WDT_TIMEOUT_S, true);
+  esp_task_wdt_add(NULL);
 
   Serial.println(F("--- Smart Feeder Node Ready ---"));
 }
@@ -258,19 +321,17 @@ void loop() {
   checkNetwork();
   if (mqtt.connected()) mqtt.loop();
 
-  handleSR04();
+  ph.calibration(phVoltage_mV, tAvg);
 
-  DateTime now = rtc.now();
-  static uint8_t lastTriggerSecond = 255;
+  uint32_t nowMs = millis();
+  if (nowMs - lastPublishMs >= PUBLISH_INTERVAL_MS) {
+    lastPublishMs = nowMs;
 
-  if ((now.second() == 0 || now.second() == 20 || now.second() == 40) && now.second() != lastTriggerSecond) {
-    lastTriggerSecond = now.second();
-    
     Serial.println(F("--- Baca Sensor ---"));
+    handleSR04();
     readDallasTemps();
     readPHfromADS();
     readDOfromADS();
-    ph.calibration(phVoltage_mV, tAvg);
 
     if (mqtt.connected()) {
       char payload[150];
@@ -287,9 +348,10 @@ void loop() {
 
       Serial.print(F("Publishing: "));
       Serial.println(payload);
-      mqtt.publish(publish_topic, payload);
+        publishOrBuffer(payload);
     } else {
       Serial.println(F("MQTT disconnect, data not sent"));
     }
   }
+    esp_task_wdt_reset();
 }

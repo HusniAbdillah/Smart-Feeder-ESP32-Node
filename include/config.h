@@ -32,6 +32,6 @@ const float DO_CAL1_T_C = 25.0f;
 const uint8_t MED_WINDOW = 15;
 const uint8_t SR04_BATCH = 15;
 const uint16_t SR04_INTER_PING_MS = 50;
-const uint32_t SR04_INTERVAL_MS = 100;
+const uint32_t PUBLISH_INTERVAL_MS = 20000;
 
 #endif
