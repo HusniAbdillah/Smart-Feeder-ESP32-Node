@@ -45,7 +45,7 @@ float doValue = 0.0;
 unsigned long lastReconnectAttempt = 0;
 unsigned long lastPublishMs = 0;
 // watchdog timeout (seconds)
-#define WDT_TIMEOUT_S 10
+#define WDT_TIMEOUT_S 60
 
 // mqtt offline buffer
 #define MAX_BUFFERED_MSGS 16
@@ -88,11 +88,20 @@ void checkNetwork() {
         Serial.println(F("ok"));
         lastReconnectAttempt = 0;
         mqttFailCount = 0;
-        // flush any buffered messages
+        // flush buffered messages 
         while (mqttBufCount > 0 && mqtt.connected()) {
+          Serial.print(F("Flushing buffer: "));
+          Serial.println(mqttBuffer[mqttBufTail]);
           mqtt.publish(publish_topic, mqttBuffer[mqttBufTail]);
           mqttBufTail = (mqttBufTail + 1) % MAX_BUFFERED_MSGS;
           mqttBufCount--;
+          if (mqttBufCount > 0) {
+            // wait 16 seconds (16 x 1s) to avoid thingspeak rate-limit (15s)
+            for (int i = 0; i < 16; i++) {
+              delay(1000);
+              esp_task_wdt_reset();
+            }
+          }
         }
       } else {
         Serial.print(F("fail, rc="));
@@ -310,7 +319,7 @@ void setup() {
   runStartupSelfTest(rtcOk, adsOk);
   lastPublishMs = millis() - PUBLISH_INTERVAL_MS;
 
-  // init watchdog (allow long blocking reads, set to safe margin)
+  // init watchdog
   esp_task_wdt_init(WDT_TIMEOUT_S, true);
   esp_task_wdt_add(NULL);
 
@@ -333,25 +342,21 @@ void loop() {
     readPHfromADS();
     readDOfromADS();
 
-    if (mqtt.connected()) {
-      char payload[150];
-      
-      float safeT1 = isValidTemp(t1) ? t1 : 0.0;
-      float safeT2 = isValidTemp(t2) ? t2 : 0.0;
-      float safeT3 = isValidTemp(t3) ? t3 : 0.0;
-      float safePH = isnan(phValue) ? 0.0 : phValue;
-      float safeDO = isnan(doValue) ? 0.0 : doValue;
+    char payload[150];
 
-      snprintf(payload, sizeof(payload), 
-               "field1=%.2f&field2=%.2f&field3=%.2f&field4=%.2f&field5=%.2f&field6=%d",
-           safeT1, safeT2, safeT3, safeDO, safePH, lastMedian);
+    float safeT1 = isValidTemp(t1) ? t1 : 0.0;
+    float safeT2 = isValidTemp(t2) ? t2 : 0.0;
+    float safeT3 = isValidTemp(t3) ? t3 : 0.0;
+    float safePH = isnan(phValue) ? 0.0 : phValue;
+    float safeDO = isnan(doValue) ? 0.0 : doValue;
 
-      Serial.print(F("Publishing: "));
-      Serial.println(payload);
-        publishOrBuffer(payload);
-    } else {
-      Serial.println(F("MQTT disconnect, data not sent"));
-    }
+    snprintf(payload, sizeof(payload), 
+             "field1=%.2f&field2=%.2f&field3=%.2f&field4=%.2f&field5=%.2f&field6=%d",
+         safeT1, safeT2, safeT3, safeDO, safePH, lastMedian);
+
+    Serial.print(F("Data prepared: "));
+    Serial.println(payload);
+    publishOrBuffer(payload);
   }
     esp_task_wdt_reset();
 }
